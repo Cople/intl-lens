@@ -8,7 +8,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::config::I18nConfig;
+use crate::config::{DisplayMode, I18nConfig};
 use crate::document::DocumentStore;
 use crate::i18n::{KeyFinder, TranslationStore};
 
@@ -30,6 +30,7 @@ pub struct I18nBackend {
     workspace_root: Arc<RwLock<Option<PathBuf>>>,
     inlay_hint_dynamic_registration_supported: Arc<RwLock<bool>>,
     inlay_hint_refresh_supported: Arc<RwLock<bool>>,
+    code_lens_refresh_supported: Arc<RwLock<bool>>,
     watched_files_dynamic_registration_supported: Arc<RwLock<bool>>,
     watched_files_relative_pattern_supported: Arc<RwLock<bool>>,
 }
@@ -45,6 +46,7 @@ impl I18nBackend {
             workspace_root: Arc::new(RwLock::new(None)),
             inlay_hint_dynamic_registration_supported: Arc::new(RwLock::new(false)),
             inlay_hint_refresh_supported: Arc::new(RwLock::new(false)),
+            code_lens_refresh_supported: Arc::new(RwLock::new(false)),
             watched_files_dynamic_registration_supported: Arc::new(RwLock::new(false)),
             watched_files_relative_pattern_supported: Arc::new(RwLock::new(false)),
         }
@@ -86,6 +88,11 @@ impl I18nBackend {
     }
 
     async fn register_inlay_hint_capability(&self) {
+        if !self.use_inlay_hints().await {
+            tracing::debug!("Skipping inlay hint registration (displayMode=codeLens)");
+            return;
+        }
+
         let supports_dynamic = *self.inlay_hint_dynamic_registration_supported.read().await;
 
         if !supports_dynamic {
@@ -516,6 +523,10 @@ impl I18nBackend {
                 continue;
             }
 
+            if Self::path_matches_locale_glob(path, root, trimmed) {
+                return true;
+            }
+
             let candidate = if Path::new(trimmed).is_absolute() {
                 PathBuf::from(trimmed)
             } else {
@@ -532,6 +543,29 @@ impl I18nBackend {
         }
 
         false
+    }
+
+    fn path_matches_locale_glob(path: &Path, root: &Path, pattern: &str) -> bool {
+        if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
+            return false;
+        }
+
+        let Ok(glob) = globset::Glob::new(pattern) else {
+            return false;
+        };
+        let matcher = glob.compile_matcher();
+
+        let Ok(relative_path) = path.strip_prefix(root) else {
+            return false;
+        };
+
+        if matcher.is_match(relative_path) {
+            return true;
+        }
+
+        relative_path
+            .parent()
+            .is_some_and(|parent| matcher.is_match(parent))
     }
 
     async fn is_translation_uri(&self, uri: &Url) -> bool {
@@ -575,7 +609,14 @@ impl I18nBackend {
             .await;
 
         *self.translation_store.write().await = Some(store);
-        self.refresh_inlay_hints().await;
+        self.refresh_active_lenses().await;
+    }
+
+    async fn refresh_active_lenses(&self) {
+        match self.config.read().await.display_mode {
+            DisplayMode::InlayHints => self.refresh_inlay_hints().await,
+            DisplayMode::CodeLens => self.refresh_code_lenses().await,
+        }
     }
 
     async fn refresh_inlay_hints(&self) {
@@ -584,6 +625,22 @@ impl I18nBackend {
                 tracing::warn!("Inlay hint refresh failed: {:?}", err);
             }
         }
+    }
+
+    async fn refresh_code_lenses(&self) {
+        if *self.code_lens_refresh_supported.read().await {
+            if let Err(err) = self.client.code_lens_refresh().await {
+                tracing::warn!("Code lens refresh failed: {:?}", err);
+            }
+        }
+    }
+
+    async fn use_inlay_hints(&self) -> bool {
+        self.config.read().await.display_mode == DisplayMode::InlayHints
+    }
+
+    async fn use_code_lens(&self) -> bool {
+        self.config.read().await.display_mode == DisplayMode::CodeLens
     }
 
     async fn re_diagnose_open_documents(&self) {
@@ -683,6 +740,16 @@ impl LanguageServer for I18nBackend {
 
         *self.inlay_hint_refresh_supported.write().await = inlay_hint_refresh_supported;
 
+        let code_lens_refresh_supported = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.code_lens.as_ref())
+            .and_then(|code_lens| code_lens.refresh_support)
+            .unwrap_or(false);
+
+        *self.code_lens_refresh_supported.write().await = code_lens_refresh_supported;
+
         let watched_files = params
             .capabilities
             .workspace
@@ -713,6 +780,10 @@ impl LanguageServer for I18nBackend {
             inlay_hint_refresh_supported
         );
         tracing::info!(
+            "Client codeLens refreshSupport: {}",
+            code_lens_refresh_supported
+        );
+        tracing::info!(
             "Client didChangeWatchedFiles dynamicRegistration: {}",
             watched_files_dynamic_registration_support
         );
@@ -739,6 +810,8 @@ impl LanguageServer for I18nBackend {
             tracing::warn!("No workspace root found in initialize params");
         }
 
+        let display_mode = self.config.read().await.display_mode;
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -762,12 +835,17 @@ impl LanguageServer for I18nBackend {
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
-                inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
-                    InlayHintOptions {
+                inlay_hint_provider: (display_mode == DisplayMode::InlayHints).then(|| {
+                    OneOf::Right(InlayHintServerCapabilities::Options(InlayHintOptions {
                         resolve_provider: Some(false),
                         work_done_progress_options: Default::default(),
+                    }))
+                }),
+                code_lens_provider: (display_mode == DisplayMode::CodeLens).then_some(
+                    CodeLensOptions {
+                        resolve_provider: Some(false),
                     },
-                ))),
+                ),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
@@ -776,13 +854,17 @@ impl LanguageServer for I18nBackend {
                     },
                 )),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["intl-lens.createRawTranslationKey".to_string()],
+                    commands: vec![
+                        "i18nlens.createRawTranslationKey".to_string(),
+                        "intl-lens.createRawTranslationKey".to_string(),
+                        "intlLens.showTranslation".to_string(),
+                    ],
                     work_done_progress_options: Default::default(),
                 }),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
-                name: "i18n-lsp".to_string(),
+                name: "i18nlens".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
         })
@@ -790,7 +872,7 @@ impl LanguageServer for I18nBackend {
 
     async fn initialized(&self, _: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "i18n-lsp server initialized")
+            .log_message(MessageType::INFO, "i18nlens server initialized")
             .await;
         self.register_inlay_hint_capability().await;
         self.register_watched_files_capability().await;
@@ -848,6 +930,8 @@ impl LanguageServer for I18nBackend {
         if self.is_translation_uri(&params.text_document.uri).await {
             tracing::info!("Translation file saved, reloading...");
             self.reload_translations().await;
+        } else if self.use_code_lens().await {
+            self.refresh_code_lenses().await;
         }
     }
 
@@ -955,6 +1039,63 @@ impl LanguageServer for I18nBackend {
         Ok(Some(GotoDefinitionResponse::Array(locations)))
     }
 
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        tracing::debug!(">>> code_lens: uri={}", uri);
+
+        if !self.use_code_lens().await {
+            return Ok(None);
+        }
+
+        let source_locale = self.config.read().await.source_locale.clone();
+
+        let docs = self.documents.read().await;
+        let Some(doc) = docs.get(uri.as_str()) else {
+            tracing::warn!("<<< code_lens: document NOT in store: {}", uri);
+            return Ok(None);
+        };
+
+        let content = doc.content.as_str();
+        let key_finder = self.key_finder.read().await;
+        let found_keys = key_finder.find_keys(content);
+
+        let translation_store = self.translation_store.read().await;
+        let Some(store) = translation_store.as_ref() else {
+            return Ok(None);
+        };
+
+        let mut lenses = Vec::new();
+
+        for found_key in found_keys {
+            let Some(translation) = store.get_translation(&found_key.key, &source_locale) else {
+                continue;
+            };
+
+            let display_text = truncate_string(&translation, 30);
+            let start = Position {
+                line: found_key.line as u32,
+                character: found_key.start_char as u32,
+            };
+            let end = Position {
+                line: found_key.line as u32,
+                character: found_key.end_char as u32,
+            };
+
+            lenses.push(CodeLens {
+                range: Range { start, end },
+                command: Some(Command {
+                    title: format!("= {}", display_text),
+                    command: "intlLens.showTranslation".to_string(),
+                    arguments: None,
+                }),
+                data: None,
+            });
+        }
+
+        tracing::debug!("<<< code_lens: returning {} lenses", lenses.len());
+        Ok(Some(lenses))
+    }
+
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let mut actions = Vec::new();
 
@@ -985,7 +1126,7 @@ impl LanguageServer for I18nBackend {
                 diagnostics: Some(vec![diagnostic.clone()]),
                 command: Some(Command {
                     title: format!("Create raw translation key '{}'", key),
-                    command: "intl-lens.createRawTranslationKey".to_string(),
+                    command: "i18nlens.createRawTranslationKey".to_string(),
                     arguments: Some(vec![Value::String(key)]),
                 }),
                 ..Default::default()
@@ -1002,7 +1143,13 @@ impl LanguageServer for I18nBackend {
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
-        if params.command != "intl-lens.createRawTranslationKey" {
+        if params.command == "intlLens.showTranslation" {
+            return Ok(None);
+        }
+
+        if params.command != "i18nlens.createRawTranslationKey"
+            && params.command != "intl-lens.createRawTranslationKey"
+        {
             return Ok(None);
         }
 
@@ -1092,6 +1239,10 @@ impl LanguageServer for I18nBackend {
         let uri = params.text_document.uri;
         tracing::debug!(">>> inlay_hint: uri={}, range={:?}", uri, params.range);
 
+        if !self.use_inlay_hints().await {
+            return Ok(None);
+        }
+
         let source_locale = self.config.read().await.source_locale.clone();
 
         let docs = self.documents.read().await;
@@ -1140,8 +1291,10 @@ impl LanguageServer for I18nBackend {
 
                 let mut hint_char = found_key.end_char;
                 if let Some(line) = content.lines().nth(found_key.line) {
-                    let line_bytes = line.as_bytes();
-                    if matches!(line_bytes.get(hint_char), Some(b'\'') | Some(b'"')) {
+                    if matches!(
+                        line.encode_utf16().nth(hint_char),
+                        Some(unit) if unit == b'\'' as u16 || unit == b'"' as u16
+                    ) {
                         hint_char += 1;
                     }
                 }
@@ -1511,6 +1664,19 @@ mod tests {
     fn test_detect_indent_tab() {
         let content = "{\n\t\"hello\": \"world\"\n}";
         assert_eq!(I18nBackend::detect_indent_unit(content), "\t");
+    }
+
+    #[test]
+    fn test_translation_file_matches_glob_locale_directory() {
+        let root = Path::new("/workspace/project");
+        let path = Path::new("/workspace/project/layers/foo/i18n/locales/en.json");
+        let locale_paths = vec!["**/*/i18n/locales".to_string()];
+
+        assert!(I18nBackend::is_translation_file_in_paths(
+            path,
+            root,
+            &locale_paths
+        ));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct I18nConfig {
-    #[serde(default = "default_locale_paths")]
+    #[serde(default = "default_locale_paths", alias = "localesPaths")]
     pub locale_paths: Vec<String>,
 
     #[serde(default = "default_source_locale")]
@@ -21,6 +21,9 @@ pub struct I18nConfig {
 
     #[serde(default = "default_function_patterns")]
     pub function_patterns: Vec<String>,
+
+    #[serde(default = "default_display_mode")]
+    pub display_mode: DisplayMode,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -32,6 +35,14 @@ pub enum KeyStyle {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisplayMode {
+    #[default]
+    InlayHints,
+    CodeLens,
+}
+
 impl Default for I18nConfig {
     fn default() -> Self {
         Self {
@@ -40,6 +51,7 @@ impl Default for I18nConfig {
             key_style: default_key_style(),
             namespace_enabled: false,
             function_patterns: default_function_patterns(),
+            display_mode: default_display_mode(),
         }
     }
 }
@@ -47,8 +59,10 @@ impl Default for I18nConfig {
 impl I18nConfig {
     pub fn load_from_workspace(root: &Path) -> Self {
         let config_paths = [
-            root.join(".i18n-ally.json"),
-            root.join("i18n-ally.config.json"),
+            root.join(".i18nlens.json"),
+            root.join("i18nlens.config.json"),
+            root.join(".intl-lens.json"),
+            root.join("intl-lens.config.json"),
             root.join(".zed/i18n.json"),
         ];
 
@@ -63,6 +77,7 @@ impl I18nConfig {
                         .is_some_and(|object| {
                             object.contains_key("localePaths")
                                 || object.contains_key("locale_paths")
+                                || object.contains_key("localesPaths")
                         });
 
                     if !has_locale_paths {
@@ -117,11 +132,8 @@ fn default_key_style() -> KeyStyle {
 
 fn default_function_patterns() -> Vec<String> {
     vec![
-        // JavaScript/TypeScript patterns
-        // Match t() but not .post(), .get(), .put(), .delete(), etc.
-        r#"(?:^|[^\w.])t\s*\(\s*["']([^"']+)["']"#.to_string(),
+        // JavaScript/TypeScript patterns (`t` is handled by the TSX parser)
         r#"i18n\.t\s*\(\s*["']([^"']+)["']"#.to_string(),
-        r#"useTranslation\s*\(\s*\)\s*.*?t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$t\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$tc\s*\(\s*["']([^"']+)["']"#.to_string(),
         r#"\$te\s*\(\s*["']([^"']+)["']"#.to_string(),
@@ -158,6 +170,10 @@ fn default_function_patterns() -> Vec<String> {
     ]
 }
 
+fn default_display_mode() -> DisplayMode {
+    DisplayMode::InlayHints
+}
+
 fn detect_framework_locale_paths(root: &Path) -> Vec<String> {
     let mut paths = Vec::new();
 
@@ -185,9 +201,11 @@ fn detect_framework_locale_paths(root: &Path) -> Vec<String> {
     if is_vue_project(root) {
         paths.push("src/locales".to_string());
         paths.push("src/i18n".to_string());
+        paths.push("src/lang".to_string());
         paths.push("locales".to_string());
         paths.push("i18n".to_string());
         paths.push("public/locales".to_string());
+        paths.extend(detect_nuxt_layer_locale_paths(root));
     }
 
     if is_svelte_project(root) {
@@ -204,6 +222,34 @@ fn detect_framework_locale_paths(root: &Path) -> Vec<String> {
         .into_iter()
         .filter(|path| root.join(path).exists())
         .collect()
+}
+
+fn detect_nuxt_layer_locale_paths(root: &Path) -> Vec<String> {
+    let layers_dir = root.join("layers");
+    let Ok(entries) = std::fs::read_dir(layers_dir) else {
+        return Vec::new();
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let layer_path = entry.path();
+        if !layer_path.is_dir() {
+            continue;
+        }
+
+        for locale_dir in ["i18n/locales", "i18n"] {
+            let candidate = layer_path.join(locale_dir);
+            if !candidate.is_dir() {
+                continue;
+            }
+
+            if let Ok(relative_path) = candidate.strip_prefix(root) {
+                paths.push(relative_path.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    paths
 }
 
 fn is_angular_project(root: &Path) -> bool {
@@ -308,4 +354,142 @@ fn is_vue_project(root: &Path) -> bool {
         || root.join("vite.config.js").exists()
         || root.join("vite.config.ts").exists()
         || root.join("nuxt.config.js").exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn detects_nuxt_layer_locale_paths() {
+        let root = test_workspace("nuxt-layer-detection");
+        fs::create_dir_all(root.join("layers/foo/i18n/locales")).expect("create layer locales");
+        fs::write(
+            root.join("nuxt.config.js"),
+            "export default defineNuxtConfig({})",
+        )
+        .expect("write nuxt config");
+        fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"@nuxtjs/i18n":"10.2.1"}}"#,
+        )
+        .expect("write package json");
+
+        let config = I18nConfig::load_from_workspace(&root);
+
+        assert!(config
+            .locale_paths
+            .contains(&"layers/foo/i18n/locales".to_string()));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_locales_paths_alias() {
+        let config = serde_json::from_str::<I18nConfig>(
+            r#"{"localesPaths":["src/lang","**/*/i18n/locales"]}"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            config.locale_paths,
+            vec!["src/lang".to_string(), "**/*/i18n/locales".to_string()]
+        );
+    }
+
+    #[test]
+    fn loads_i18nlens_config_before_legacy_and_zed_config() {
+        let root = test_workspace("i18nlens-config-priority");
+        fs::create_dir_all(root.join(".zed")).expect("create zed dir");
+        fs::write(
+            root.join(".i18nlens.json"),
+            r#"{"localePaths":["i18nlens-locales"],"sourceLocale":"ja"}"#,
+        )
+        .expect("write i18nlens config");
+        fs::write(
+            root.join(".intl-lens.json"),
+            r#"{"localePaths":["intl-locales"],"sourceLocale":"vi"}"#,
+        )
+        .expect("write intl lens config");
+        fs::write(
+            root.join(".zed/i18n.json"),
+            r#"{"localePaths":["zed-locales"],"sourceLocale":"en"}"#,
+        )
+        .expect("write zed config");
+
+        let config = I18nConfig::load_from_workspace(&root);
+
+        assert_eq!(config.locale_paths, vec!["i18nlens-locales".to_string()]);
+        assert_eq!(config.source_locale, "ja");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn loads_legacy_intl_lens_config_before_zed_config() {
+        let root = test_workspace("intl-lens-config-priority");
+        fs::create_dir_all(root.join(".zed")).expect("create zed dir");
+        fs::write(
+            root.join(".intl-lens.json"),
+            r#"{"localePaths":["intl-locales"],"sourceLocale":"vi"}"#,
+        )
+        .expect("write intl lens config");
+        fs::write(
+            root.join(".zed/i18n.json"),
+            r#"{"localePaths":["zed-locales"],"sourceLocale":"en"}"#,
+        )
+        .expect("write zed config");
+
+        let config = I18nConfig::load_from_workspace(&root);
+
+        assert_eq!(config.locale_paths, vec!["intl-locales".to_string()]);
+        assert_eq!(config.source_locale, "vi");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ignores_legacy_config_files() {
+        let root = test_workspace("legacy-config-ignored");
+        fs::create_dir_all(&root).expect("create root");
+        let legacy_file = [".i18n", "-ally.json"].concat();
+        fs::write(
+            root.join(legacy_file),
+            r#"{"localePaths":["legacy-locales"],"sourceLocale":"vi"}"#,
+        )
+        .expect("write legacy config");
+
+        let config = I18nConfig::load_from_workspace(&root);
+
+        assert_ne!(config.locale_paths, vec!["legacy-locales".to_string()]);
+        assert_eq!(config.source_locale, "en");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn defaults_to_inlay_hints_display_mode() {
+        let config = serde_json::from_str::<I18nConfig>(r#"{}"#).expect("parse config");
+
+        assert_eq!(config.display_mode, DisplayMode::InlayHints);
+    }
+
+    #[test]
+    fn reads_code_lens_display_mode() {
+        let config = serde_json::from_str::<I18nConfig>(r#"{"displayMode":"codeLens"}"#)
+            .expect("parse config");
+
+        assert_eq!(config.display_mode, DisplayMode::CodeLens);
+    }
+
+    fn test_workspace(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("intl-lens-{name}-{nonce}"))
+    }
 }

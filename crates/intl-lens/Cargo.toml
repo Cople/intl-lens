@@ -5,23 +5,31 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "i18n Lens - LSP server, CLI, and MCP server for internationalization"
+description = "i18n intelligence layer with LSP, CLI, and MCP interfaces"
 
 [lib]
 name = "intl_lens"
 path = "src/lib.rs"
 
 [[bin]]
-name = "intl-lens"
+name = "i18nlens"
 path = "src/main.rs"
+
+[[bin]]
+name = "intl-lens"
+path = "src/legacy_main.rs"
 
 [[bin]]
 name = "intl-lens-cli"
 path = "src/cli.rs"
 
 [[bin]]
-name = "intl-lens-mcp"
+name = "i18nlens-mcp"
 path = "src/mcp.rs"
+
+[[bin]]
+name = "intl-lens-mcp"
+path = "src/legacy_mcp.rs"
 
 [dependencies]
 tower-lsp.workspace = true
@@ -36,6 +44,13 @@ dashmap.workspace = true
 regex.workspace = true
 globset.workspace = true
 walkdir.workspace = true
+tree-sitter = "0.26.11"
+tree-sitter-typescript = "0.23.2"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 indicatif = "0.17"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

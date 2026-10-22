@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,23 +22,28 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: intl-lens-x86_64-unknown-linux-gnu.tar.gz
+            name: i18nlens-x86_64-unknown-linux-gnu.tar.gz
+            legacy_name: intl-lens-x86_64-unknown-linux-gnu.tar.gz
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            name: intl-lens-aarch64-unknown-linux-gnu.tar.gz
+            name: i18nlens-aarch64-unknown-linux-gnu.tar.gz
+            legacy_name: intl-lens-aarch64-unknown-linux-gnu.tar.gz
 
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: intl-lens-x86_64-apple-darwin.tar.gz
+            name: i18nlens-x86_64-apple-darwin.tar.gz
+            legacy_name: intl-lens-x86_64-apple-darwin.tar.gz
 
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: intl-lens-aarch64-apple-darwin.tar.gz
+            name: i18nlens-aarch64-apple-darwin.tar.gz
+            legacy_name: intl-lens-aarch64-apple-darwin.tar.gz
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            name: intl-lens-x86_64-pc-windows-msvc.zip
+            name: i18nlens-x86_64-pc-windows-msvc.zip
+            legacy_name: intl-lens-x86_64-pc-windows-msvc.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -64,20 +70,24 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }} intl-lens
+          tar czf ../../../${{ matrix.name }} i18nlens intl-lens
+          tar czf ../../../${{ matrix.legacy_name }} intl-lens i18nlens
           cd ../../..
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }} intl-lens.exe
+          7z a ../../../${{ matrix.name }} i18nlens.exe intl-lens.exe
+          7z a ../../../${{ matrix.legacy_name }} intl-lens.exe i18nlens.exe
           cd ../../..
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.legacy_name }}
 
   release:
     needs: build
@@ -98,3 +108,27 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify npm package version matches tag
+        run: |
+          node -e 'const pkg=require("./package.json"); const tag=process.env.GITHUB_REF_NAME; if (tag !== "v" + pkg.version) { throw new Error("tag " + tag + " does not match package version v" + pkg.version); }'
+
+      - name: Validate npm package
+        run: npm pack --dry-run
+
+      - name: Publish npm package
+        run: npm publish --access public

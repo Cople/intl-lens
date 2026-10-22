@@ -3,11 +3,11 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.11"
 edition = "2021"
 license = "MIT"
 authors = ["Trong Nguyen"]
-repository = "https://github.com/nguyenphutrong/intl-lens"
+repository = "https://github.com/nguyenphutrong/i18nlens"
 
 [workspace.dependencies]
 tower-lsp = "0.20"
